@@ -584,5 +584,120 @@ async def estimate_stream(task_id: str):
                                       "Connection": "keep-alive"})
 
 
+@app.post("/download-cost-report/{task_id}")
+@app.get("/download-cost-report/{task_id}")
+async def download_cost_report(task_id: str):
+    entry = task_store.get(task_id)
+    if not entry or not entry.get("result"):
+        raise HTTPException(404, "Result not ready or not found")
+    result  = entry["result"]
+    report  = result.get("cost_report", "")
+    valid   = result.get("validation", "")
+    vehicle = result.get("vehicle", {})
+    cid     = f"COST-{str(uuid.uuid4())[:6].upper()}"
+    buf    = io.BytesIO()
+    styles = getSampleStyleSheet()
+    doc    = SimpleDocTemplate(buf, pagesize=A4,
+                               leftMargin=1.5*cm, rightMargin=1.5*cm,
+                               topMargin=1.5*cm,  bottomMargin=1.5*cm)
+    elems  = []
+    hdr_data = [[
+        Paragraph('<font color="#6C63FF" size="16"><b>CarScan AI</b></font>'
+                  '<br/><font color="#8B949E" size="9">Cost Estimation Report</font>',
+                  styles["Normal"]),
+        Paragraph(f'<font color="#00D4FF" size="12"><b>REPAIR ESTIMATE</b></font>'
+                  f'<br/><font color="#8B949E" size="8">Ref: {cid}</font>'
+                  f'<br/><font color="#8B949E" size="8">{datetime.date.today()}</font>',
+                  ParagraphStyle("r2", parent=styles["Normal"], alignment=TA_RIGHT))
+    ]]
+    hdr = Table(hdr_data, colWidths=[9*cm, 9*cm])
+    hdr.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0),(-1,-1), DARK),
+        ("BOX",          (0,0),(-1,-1), 1.5, ACCENT),
+        ("TOPPADDING",   (0,0),(-1,-1), 14),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 14),
+        ("LEFTPADDING",  (0,0),(-1,-1), 14),
+        ("RIGHTPADDING", (0,0),(-1,-1), 14),
+    ]))
+    elems += [hdr, Spacer(1, 0.5*cm)]
+    body_style = ParagraphStyle("body", parent=styles["Normal"],
+                                textColor=colors.black, fontSize=9,
+                                leading=14, spaceAfter=4)
+    table_head_style = ParagraphStyle("th", parent=styles["Normal"],
+                                      textColor=colors.whitesmoke, fontSize=9, fontName="Helvetica-Bold", alignment=TA_CENTER)
+    table_body_style = ParagraphStyle("td", parent=styles["Normal"],
+                                      textColor=colors.black, fontSize=9, alignment=TA_CENTER)
+
+    def parse_markdown_to_pdf(text_markdown, target_elems):
+        table_data = []
+        def flush_table():
+            if table_data:
+                t = Table(table_data)
+                t.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), HexColor("#333333")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+                    ("BACKGROUND", (0, 1), (-1, -1), HexColor("#F5F5F5")),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ]))
+                target_elems.append(t)
+                target_elems.append(Spacer(1, 0.2*cm))
+                table_data.clear()
+        for line in text_markdown.split("\n"):
+            line = line.strip()
+            if not line:
+                target_elems.append(Spacer(1, 0.15*cm))
+                flush_table()
+                continue
+            safe = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            if safe.startswith("|") and safe.endswith("|"):
+                cells = [c.strip() for c in safe.split("|")[1:-1]]
+                if all(c.replace("-", "").replace(":", "") == "" for c in cells):
+                    continue
+                is_header = len(table_data) == 0
+                formatted_cells = []
+                for c in cells:
+                    c = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', c)
+                    st = table_head_style if is_header else table_body_style
+                    formatted_cells.append(Paragraph(c, st))
+                table_data.append(formatted_cells)
+                continue
+            else:
+                flush_table()
+                safe = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', safe)
+                if safe.startswith("## "):
+                    target_elems.append(Spacer(1, 0.2*cm))
+                    target_elems.append(Paragraph(
+                        f'<font color="#ff2a2a" size="11"><b>{safe[3:]}</b></font>',
+                        styles["Normal"]))
+                    target_elems.append(Spacer(1, 0.1*cm))
+                elif safe.startswith("# "):
+                    target_elems.append(Spacer(1, 0.2*cm))
+                    target_elems.append(Paragraph(
+                        f'<font color="#ff2a2a" size="13"><b>{safe[2:]}</b></font>',
+                        styles["Normal"]))
+                    target_elems.append(Spacer(1, 0.1*cm))
+                elif safe.startswith("- ") or safe.startswith("* "):
+                    target_elems.append(Paragraph(f"\u2022 {safe[2:]}", body_style))
+                else:
+                    target_elems.append(Paragraph(safe, body_style))
+        flush_table()
+
+    parse_markdown_to_pdf(report, elems)
+    elems += [Spacer(1, 0.4*cm),
+              HRFlowable(width="100%", thickness=0.5, color=BORDER),
+              Spacer(1, 0.3*cm)]
+    elems.append(Paragraph('<font color="#ff2a2a" size="11"><b>COST VALIDATION</b></font>',
+                            styles["Normal"]))
+    elems.append(Spacer(1, 0.2*cm))
+    parse_markdown_to_pdf(valid, elems)
+    doc.build(elems)
+    buf.seek(0)
+    return Response(content=buf.read(), media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="cost_estimate_{cid}.pdf"'})
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
