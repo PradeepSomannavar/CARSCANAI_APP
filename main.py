@@ -409,5 +409,180 @@ async def generate_report(request: Request):
         raise HTTPException(500, f"Report generation failed: {e}")
 
 
+# PDF Parsing
+def extract_json_from_pdf(pdf_bytes: bytes) -> dict:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = "".join(page.extract_text() or "" for page in pdf.pages)
+        matches = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+        for m in matches:
+            try:
+                obj = json.loads(m)
+                if "damages" in obj and "vehicle" in obj:
+                    return obj
+            except Exception:
+                continue
+        return {}
+    except Exception as e:
+        print(f"PDF parse error: {e}")
+        return {}
+
+
+def merge_report_data(reports: list) -> dict:
+    if not reports:
+        return {}
+    merged = reports[0].copy()
+    all_damages = []
+    for r in reports:
+        all_damages.extend(r.get("damages", []))
+    seen, unique = set(), []
+    for d in all_damages:
+        key = d.get("part", "")
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(d)
+    merged["damages"] = unique
+    merged["total_parts_damaged"] = len(unique)
+    return merged
+
+
+def build_cost_topic(merged: dict) -> str:
+    v      = merged.get("vehicle", {})
+    damages = merged.get("damages", [])
+    brand  = v.get("brand", "Unknown")
+    model  = v.get("model_name", v.get("model", "Unknown"))
+    year   = v.get("year", "")
+    city   = v.get("city", "India")
+    dmg_list = ", ".join(d.get("part","") for d in damages) or "general damage"
+    return (
+        f"Car repair cost for {year} {brand} {model} with: {dmg_list}. "
+        f"Find OEM and aftermarket spare part prices. Location: {city}. "
+        f"Include labor rates for automotive body repair."
+    )
+
+
+task_store: dict = {}
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+def _run_pipeline_thread(task_id: str, topic: str, merged: dict,
+                         queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+    def emit(data: dict):
+        asyncio.run_coroutine_threadsafe(queue.put(data), loop)
+    try:
+        sys.path.insert(0, str(BASE_DIR))
+        from cost_agents import (build_search_agent, build_reader_agent,
+                                 cost_writer_chain, cost_critic_chain)
+        vehicle = merged.get("vehicle", {})
+        damages = merged.get("damages", [])
+        dmg_str = ", ".join(d.get("part","") for d in damages)
+
+        emit({"step": 1, "status": "running",
+              "message": "Searching for part prices and repair costs online..."})
+        search_agent = build_search_agent()
+        search_res = search_agent.invoke({
+            "messages": [("user",
+                f"Find current repair costs and spare parts prices: {topic}. "
+                "Include OEM and aftermarket prices. List specific prices in INR.")]
+        })
+        search_text = search_res["messages"][-1].content
+        emit({"step": 1, "status": "done", "message": "Pricing data found"})
+
+        emit({"step": 2, "status": "running",
+              "message": "Scraping automotive pricing sites for detailed data..."})
+        reader_agent = build_reader_agent()
+        reader_res = reader_agent.invoke({
+            "messages": [("user",
+                f"From these search results about '{topic}', "
+                f"pick the most relevant URL and scrape it for part prices.\n\n"
+                f"Search Results:\n{search_text[:1000]}")]
+        })
+        scraped = reader_res["messages"][-1].content
+        emit({"step": 2, "status": "done", "message": "Site data extracted"})
+
+        emit({"step": 3, "status": "running",
+              "message": "Generating detailed repair cost estimate..."})
+        research = f"SEARCH RESULTS:\n{search_text}\n\nSCRAPED CONTENT:\n{scraped}"
+        cost_report = cost_writer_chain.invoke({
+            "topic":          topic,
+            "research":       research,
+            "vehicle_brand":  vehicle.get("brand", "Unknown"),
+            "vehicle_model":  vehicle.get("model_name", vehicle.get("model", "Unknown")),
+            "vehicle_year":   vehicle.get("year", ""),
+            "damages":        dmg_str,
+        })
+        emit({"step": 3, "status": "done", "message": "Cost estimate ready"})
+
+        emit({"step": 4, "status": "running",
+              "message": "Validating estimate for accuracy and realism..."})
+        vehicle_str = f"{vehicle.get('year','')} {vehicle.get('brand','')} {vehicle.get('model_name', vehicle.get('model',''))}".strip()
+        feedback = cost_critic_chain.invoke({
+            "report":   cost_report,
+            "vehicle":  vehicle_str or "Unknown vehicle",
+            "damages":  dmg_str or "general damage",
+        })
+        emit({"step": 4, "status": "done", "message": "Validation complete"})
+
+        final_result = {
+            "cost_report":  cost_report,
+            "validation":   feedback,
+            "vehicle":      vehicle,
+            "damages":      damages,
+            "topic":        topic,
+        }
+        task_store[task_id]["result"] = final_result
+        emit({"step": "done", "result": final_result})
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        print(f"Pipeline error: {err}")
+        emit({"step": "error", "message": str(e)})
+    finally:
+        task_store[task_id]["done"] = True
+
+
+@app.post("/estimate-cost")
+async def start_estimate(reports: List[UploadFile] = File(...)):
+    task_id  = str(uuid.uuid4())
+    rep_data = []
+    for r in reports:
+        content = await r.read()
+        data    = extract_json_from_pdf(content)
+        if data:
+            rep_data.append(data)
+    if not rep_data:
+        rep_data = [{"vehicle": {}, "damages": [], "total_parts_damaged": 0}]
+    merged = merge_report_data(rep_data)
+    topic  = build_cost_topic(merged)
+    loop  = asyncio.get_event_loop()
+    queue = asyncio.Queue()
+    task_store[task_id] = {"queue": queue, "loop": loop, "done": False, "result": None}
+    loop.run_in_executor(
+        executor,
+        lambda: _run_pipeline_thread(task_id, topic, merged, queue, loop)
+    )
+    return {"task_id": task_id, "topic": topic, "vehicle": merged.get("vehicle", {})}
+
+
+@app.get("/estimate-stream/{task_id}")
+async def estimate_stream(task_id: str):
+    if task_id not in task_store:
+        raise HTTPException(404, "Task not found")
+    async def gen() -> AsyncGenerator[str, None]:
+        q = task_store[task_id]["queue"]
+        while True:
+            try:
+                data = await asyncio.wait_for(q.get(), timeout=180.0)
+                yield f"data: {json.dumps(data)}\n\n"
+                if data.get("step") in ["done", "error"]:
+                    break
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'step': 'keepalive'})}\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no",
+                                      "Connection": "keep-alive"})
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
