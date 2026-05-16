@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+
+# Mobile project (frontend)
+mobile/
+
+# Local configuration and logs
+.env
+.git/
+.gitignore
+.expo/
+*.log
+
+# Temporary data
+reports/*.pdf
+static/uploads/
+.pytest_cache/
+.vscode/
+.idea/
